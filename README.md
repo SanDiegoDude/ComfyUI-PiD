@@ -60,11 +60,24 @@ shift, intended for 1024 LDM → 4K decoding). Pick the variant at the CLI via
 
 The released decoder weights and the encoder/decoder ("VAE") weights they
 depend on are hosted at [`nvidia/PiD`](https://huggingface.co/nvidia/PiD) on
-the Hugging Face Hub. Pull just the `checkpoints/` tree into this repo:
+the Hugging Face Hub.
+
+**ComfyUI users:** the `PiD Decode` node will auto-download the per-backbone
+decoder + the auxiliary VAE / RAE files into `<ComfyUI>/models/PiD/` on first
+use. You don't have to run anything manually unless you want to pre-stage the
+files. Roughly 3 GB per diffusers backbone (flux / flux2 / sd3 / zimage),
+~4.4 GB for `rae` / `scale_rae`.
+
+**CLI users (or anyone who'd rather pre-stage):** pull the `checkpoints/`
+tree into this repo:
 
 ```bash
 hf download nvidia/PiD --local-dir . --include "checkpoints/*"
 ```
+
+The ComfyUI node also respects this layout — if `<repo>/checkpoints/` already
+contains model files when the node fires, it'll prefer those over the
+`<ComfyUI>/models/PiD/` location and skip the download entirely.
 
 ## Running inference
 
@@ -239,5 +252,3 @@ and the DCO sign-off requirement.
     year={2026}
 }
 ```
-"# ComfyUI-PiD" 
-"# ComfyUI-PiD" 

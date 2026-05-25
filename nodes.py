@@ -35,14 +35,143 @@ _MODEL_CACHE: dict[tuple[str, str], tuple] = {}
 # ---------------------------------------------------------------------------
 _PROMPT_CACHE: dict[tuple[str, str, str], torch.Tensor] = {}
 
+# ---------------------------------------------------------------------------
+# Auto-download configuration.
+#
+# All PiD assets (the per-(backbone, ckpt_type) decoder .pth + the auxiliary
+# VAE / RAE / Scale-RAE files used by the corresponding tokenizer) are hosted
+# at https://huggingface.co/nvidia/PiD under a single `checkpoints/...` tree.
+#
+# We mirror that tree into one of two places, in this order of preference:
+#   1. <ComfyUI>/models/PiD/checkpoints/...     (preferred — standard layout)
+#   2. <repo>/checkpoints/...                   (legacy — for users who already
+#                                               followed the upstream README's
+#                                               huggingface-cli download command)
+#
+# The chosen root becomes the cwd during model load so the relative
+# `./checkpoints/...` paths embedded in the upstream tokenizer code resolve
+# correctly without us having to monkey-patch them.
+# ---------------------------------------------------------------------------
+_HF_REPO_ID = "nvidia/PiD"
+
+# Auxiliary files each backbone needs in addition to its PiD decoder .pth.
+# Paths are relative to the asset root (i.e. they include the leading
+# `checkpoints/` segment to match the upstream HF repo layout).
+_AUX_FILES_PER_BACKBONE: dict[str, tuple[str, ...]] = {
+    "flux":      ("checkpoints/ae.safetensors",),
+    "flux2":     ("checkpoints/flux2_ae.safetensors",),
+    "sd3":       ("checkpoints/sd3_vae/vae/diffusion_pytorch_model.safetensors",),
+    "zimage":    ("checkpoints/ae.safetensors",),  # reuses Flux1 VAE
+    "rae": (
+        "checkpoints/rae/decoders/dinov2/wReg_base/ViTXL_n08_i512/model.pt",
+        "checkpoints/rae/stats/dinov2/wReg_base/imagenet1k_512/stat.pt",
+    ),
+    "scale_rae": (
+        "checkpoints/scale_rae/decoder/siglip2_sop14_i224_web73M_ganw3_decXL.pt",
+        "checkpoints/scale_rae/decoder/XL_decoder_config.json",
+    ),
+}
+
+
+def _comfy_pid_models_dir():
+    """Return <ComfyUI>/models/PiD, or None if ComfyUI's folder_paths isn't importable."""
+    try:
+        import folder_paths
+    except ImportError:
+        return None
+    return os.path.join(folder_paths.models_dir, "PiD")
+
+
+_MODEL_FILE_SUFFIXES = (".pth", ".pt", ".safetensors")
+
+
+def _has_model_files(root: str) -> bool:
+    """True iff `root` contains at least one .pth/.pt/.safetensors anywhere under it.
+
+    Used to detect a populated legacy `<repo>/checkpoints/` tree without being
+    fooled by the empty placeholder directories the upstream repo ships.
+    """
+    if not os.path.isdir(root):
+        return False
+    for _dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith(_MODEL_FILE_SUFFIXES):
+                return True
+    return False
+
+
+def _resolve_asset_root() -> str:
+    """Choose where PiD assets live (and will be downloaded into).
+
+    Prefers <ComfyUI>/models/PiD. Falls back to the legacy <repo>/checkpoints/
+    layout only when the user already populated it (so we don't force a
+    re-download for people who followed the upstream README).
+
+    The upstream repo ships empty placeholder directories under
+    `<repo>/checkpoints/` — only treat that path as "populated" once it
+    actually contains a model file, not just empty subdirs.
+    """
+    legacy_ckpt_dir = os.path.join(_PID_ROOT, "checkpoints")
+    if _has_model_files(legacy_ckpt_dir):
+        return _PID_ROOT
+
+    comfy_root = _comfy_pid_models_dir()
+    if comfy_root is not None:
+        os.makedirs(comfy_root, exist_ok=True)
+        return comfy_root
+
+    # No ComfyUI folder_paths available (e.g. running outside Comfy) — use
+    # the repo root and let hf_hub_download create the checkpoints/ tree there.
+    return _PID_ROOT
+
+
+def _ensure_asset(asset_root: str, rel_path: str) -> str:
+    """Return the absolute path to `rel_path` under `asset_root`, downloading it
+    from `nvidia/PiD` on Hugging Face if it isn't already on disk.
+    """
+    target = os.path.join(asset_root, rel_path)
+    if os.path.exists(target):
+        return target
+
+    from huggingface_hub import hf_hub_download
+
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    logger.info(
+        f"PiD: '{rel_path}' not found under {asset_root}; "
+        f"downloading from huggingface.co/{_HF_REPO_ID} (one-time, may take a while)…"
+    )
+    return hf_hub_download(
+        repo_id=_HF_REPO_ID,
+        filename=rel_path,
+        local_dir=asset_root,
+    )
+
+
+def _ensure_pid_assets(backbone: str, ckpt_type: str) -> tuple[str, str]:
+    """Make sure every file PiD needs for (backbone, ckpt_type) is on disk.
+
+    Returns (asset_root, absolute_path_to_pid_decoder_pth).
+    """
+    from pid._src.inference.checkpoint_registry import get_pid_checkpoint
+
+    ckpt_info = get_pid_checkpoint(backbone, ckpt_type)
+    asset_root = _resolve_asset_root()
+
+    decoder_path = _ensure_asset(asset_root, ckpt_info.checkpoint_path)
+    for aux in _AUX_FILES_PER_BACKBONE.get(backbone, ()):
+        _ensure_asset(asset_root, aux)
+
+    return asset_root, decoder_path
+
 
 def _get_available_backbones():
     """Return the list of backbone + ckpt_type combos that have checkpoints present."""
     from pid._src.inference.checkpoint_registry import PID_CHECKPOINT_REGISTRY
 
+    asset_root = _resolve_asset_root()
     available = []
     for (backbone, ckpt_type), ckpt_info in PID_CHECKPOINT_REGISTRY.items():
-        ckpt_path = os.path.join(_PID_ROOT, ckpt_info.checkpoint_path)
+        ckpt_path = os.path.join(asset_root, ckpt_info.checkpoint_path)
         if os.path.exists(ckpt_path):
             available.append(f"{backbone}_{ckpt_type}")
     return available
@@ -62,31 +191,33 @@ def _load_pid_model(backbone: str, ckpt_type: str):
 
     ckpt_info = get_pid_checkpoint(backbone, ckpt_type)
     experiment_name = ckpt_info.experiment
-    checkpoint_path = ckpt_info.checkpoint_path
 
-    # Resolve relative checkpoint path against the PiD repo root
-    if not os.path.isabs(checkpoint_path):
-        checkpoint_path = os.path.join(_PID_ROOT, checkpoint_path)
-
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"PiD checkpoint not found at: {checkpoint_path}\n"
-            f"Please download checkpoints first:\n"
-            f"  cd {_PID_ROOT}\n"
-            f"  huggingface-cli download nvidia/PiD --local-dir . --include \"checkpoints/*\""
-        )
+    # Resolve assets — downloads any missing decoder/auxiliary files from
+    # huggingface.co/nvidia/PiD into <ComfyUI>/models/PiD (or, if the user
+    # pre-populated the legacy <repo>/checkpoints/ layout, into that).
+    asset_root, checkpoint_path = _ensure_pid_assets(backbone, ckpt_type)
 
     config_file = os.path.join(_PID_ROOT, "pid", "_src", "configs", "pid", "config.py")
 
-    model, config = load_model_from_checkpoint(
-        experiment_name=experiment_name,
-        checkpoint_path=checkpoint_path,
-        config_file=config_file,
-        enable_fsdp=False,
-        experiment_opts=[],
-        strict=False,
-        load_ema_to_reg=False,
-    )
+    # The upstream tokenizer code (flux_vae.py, dinov2_vae.py, etc.) hardcodes
+    # auxiliary VAE/RAE paths as `./checkpoints/...`, resolved against cwd. To
+    # honor that without monkey-patching the tokenizers, run the load with cwd
+    # set to the asset root. Restore in finally so we don't leak chdir state
+    # back to ComfyUI's worker.
+    _prev_cwd = os.getcwd()
+    try:
+        os.chdir(asset_root)
+        model, config = load_model_from_checkpoint(
+            experiment_name=experiment_name,
+            checkpoint_path=checkpoint_path,
+            config_file=config_file,
+            enable_fsdp=False,
+            experiment_opts=[],
+            strict=False,
+            load_ema_to_reg=False,
+        )
+    finally:
+        os.chdir(_prev_cwd)
     model.eval()
 
     # Apply channels_last memory layout to the VAE encoder to speed up conv operations on Tensor Cores
