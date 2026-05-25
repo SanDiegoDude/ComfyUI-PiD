@@ -220,13 +220,18 @@ def _load_pid_model(backbone: str, ckpt_type: str):
         os.chdir(_prev_cwd)
     model.eval()
 
-    # Apply channels_last memory layout to the VAE encoder to speed up conv operations on Tensor Cores
-    if hasattr(model, "vae_encoder") and model.vae_encoder is not None:
-        try:
-            model.vae_encoder.to(memory_format=torch.channels_last)
-            logger.info("PiD: Optimized VAE encoder to channels_last layout.")
-        except Exception as e:
-            logger.warning(f"Failed to optimize VAE memory layout: {e}")
+    # NOTE: an earlier version tried to apply channels_last to model.vae_encoder
+    # here. It logged "Failed to optimize VAE memory layout" because the
+    # vae_encoder attribute holds a FluxVAEInterface / DinoV2VAEInterface /
+    # etc. wrapper (not an nn.Module — the actual nn.Module sits at
+    # model.vae_encoder.model.model). More importantly, the released distill
+    # checkpoints all have lq_condition_type="latent" (see
+    # pid/_src/configs/pid/experiment/shared_config.py), so the vae_encoder is
+    # never invoked at inference: PiD reads the pre-encoded LQ_latent straight
+    # from the data batch and the image branch of the LQ projection is unused.
+    # Optimizing a forward pass that never runs is wasted work, so the block
+    # has been removed. spatial_compression_factor (read in decode() to size
+    # the output) is a property, not a forward, and works without any of this.
 
     # Offload to CPU initially to save VRAM when not executing
     model.to("cpu")
