@@ -1,51 +1,79 @@
-# requirements.txt for PiD custom node package in ComfyUI
-# Usage: python_embedded\python.exe -m pip install -r requirements.txt
+# requirements.txt for the PiD ComfyUI custom node.
+#
+# Scope: only what the ComfyUI node actually load-paths import.
+# (The upstream PiD repo ships demo scripts, training tooling, and S3
+#  inference helpers that are NOT executed by the node — those deps were
+#  removed below; see comments at the bottom for the full list.)
+#
+# Usage:
+#   /shared-big/ComfyUI/venv/bin/pip install -r requirements.txt
+#
+# Most of these are already present in a typical ComfyUI venv — running this
+# file should be a near-no-op and is safe to re-run idempotently.
 
-# --- Core Diffusion & HuggingFace dependencies ---
-diffusers>=0.37.0
-transformers>=4.57.1
+# --- HuggingFace stack (text encoder + tokenizer + state-dict loaders) -------
+# transformers is needed for:
+#   * gemma-2-2b-it text encoder (AutoModelForCausalLM, AutoTokenizer)
+#   * vit_mae internals used by the rae / scale_rae tokenizers
+# Pin floor matches what upstream tested with; do NOT upgrade past 4.57.x
+# without re-checking from_ldm_siglip — Scale-RAE's Qwen LM regresses on 5.x.
+transformers>=4.57.1,<4.58
 safetensors
-sentencepiece
-huggingface-hub>=1.0
+sentencepiece    # required by the gemma-2 SentencePiece tokenizer
+# huggingface-hub: do NOT pin >=1.0 here. transformers 4.57.x caps it
+# at <1.0, so a >=1.0 pin breaks the install. Let transformers resolve it.
 
-# --- Imaging / IO / Utils ---
+# --- Imaging / IO ------------------------------------------------------------
+# pandas + imageio are hard-imported at module load by the easy_io handler
+# registry, so they're mandatory even though the node never reads tabular
+# data or video.
 einops
-pandas
 pillow
 imageio
-opencv-python-headless
+pandas
 
-# --- Config & Experiment plumbing ---
+# --- Config & experiment plumbing -------------------------------------------
+# hydra/omegaconf pins MUST stay exact: PiD uses deeper APIs (LazyConfig,
+# ConfigStore, GlobalHydra) that have broken across minor versions.
 hydra-core==1.3.2
 omegaconf==2.3.0
 pyyaml
-attrs
-attr
+attrs            # provides both `attrs` and `attr` namespaces
 
-# --- Logging & Utils ---
+# --- Logging / utils (all hard-imported by imaginaire/utils/misc.py) --------
 loguru
 termcolor
-fvcore
-iopath
-pynvml
-wandb
+fvcore           # only fvcore.common.registry.Registry is used
+iopath           # only iopath.common.file_io is used (PathManager + handlers)
+pynvml           # GPU memory probing
+wandb            # imported at module top in misc.py; never actually used at runtime
 
-# --- Build tools ---
-ninja
-packaging
-
-# --- Cloud/S3 integration (imported lazily by the codebase) ---
+# --- S3 checkpointer (boto3/botocore are hard-imported via dcp.py -> s3_filesystem.py) ---
+# Only exercised if you point at an s3:// checkpoint, but the import is eager.
+# boto3/botocore must move together — bump them in lockstep if at all.
 boto3>=1.34
 botocore>=1.34
 
-# --- PyTorch (Pre-installed in ComfyUI python_embedded) ---
-# We do not uncomment these to prevent overriding your ComfyUI PyTorch build,
-# but they are the versions that the repository is tested with:
-# torch==2.8.0
-# torchvision==0.23.0
-
-# --- NumPy (Pre-installed in ComfyUI python_embedded) ---
-# Note: PiD recommends numpy==1.26.4 because NumPy 2.x removes np.int/np.float
-# and breaks dtype promotion in some downstream packages. Uncomment if needed,
-# but be aware it might affect other custom nodes.
-# numpy==1.26.4
+# ----------------------------------------------------------------------------
+# Intentionally NOT listed (vs. upstream's environment.yml / requirements.txt):
+#
+#   torch / torchvision   — bring your own; ComfyUI manages this.
+#                           See "Known torch-version pitfall" in README.
+#   numpy                 — already in your ComfyUI venv; PiD doesn't actually
+#                           use any np.int / np.float APIs that broke in 2.x,
+#                           so don't downgrade to 1.26.4.
+#   diffusers             — only used by the non-node demo scripts
+#                           (pid/_src/inference/from_*; pipeline_registry.py)
+#                           and a never-called diffusers VAE helper. The node
+#                           itself works without it.
+#   opencv-python-headless — only imported by pid/_ext/imaginaire/visualize/,
+#                            which is never loaded from the node.
+#   ninja                  — no `import ninja` anywhere in the codebase; it's
+#                            a build helper for compiling flash-attn from
+#                            source, which this node does not do.
+#   packaging              — transitively pulled by half of the deps above.
+#   attr                   — DO NOT add this. The PyPI `attr` package is a
+#                            different, legacy lib. The `attrs` package (above)
+#                            already exposes the `attr` namespace, which is
+#                            what config_helper.py imports.
+# ----------------------------------------------------------------------------
