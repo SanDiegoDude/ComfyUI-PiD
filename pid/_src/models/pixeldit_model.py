@@ -150,8 +150,16 @@ class PixelDiTModel(ImaginaireModel):
 
         # Frozen text encoder. Use object.__setattr__ so DCP / nn.Module don't try to
         # register it as a child / save it in state_dict.
+        #
+        # Load directly onto CUDA (when available) so the null-caption forward
+        # below runs on GPU. The original code path forced device="cpu" here,
+        # which made that single forward of gemma-2-2b through ~500 padded
+        # tokens take ~6 minutes on a typical workstation CPU. ComfyUI then
+        # immediately offloads the encoder back to CPU once the model is
+        # cached, so the on-GPU residency is purely transient.
+        _enc_device = "cuda" if torch.cuda.is_available() else "cpu"
         with misc.timer("PixelDiTModel: load_text_encoder"):
-            _tokenizer, _text_encoder = _load_text_encoder(config.text_encoder_name, device="cpu")
+            _tokenizer, _text_encoder = _load_text_encoder(config.text_encoder_name, device=_enc_device)
             object.__setattr__(self, "tokenizer", _tokenizer)
             object.__setattr__(self, "text_encoder", _text_encoder)
             self._chi_prompt_str = "\n".join(config.chi_prompt) if config.chi_prompt else ""

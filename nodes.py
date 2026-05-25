@@ -334,13 +334,16 @@ class PiDDecode:
                     "default": "2k",
                     "tooltip": "2k: 512→2048px decoder. 2kto4k: 1024→4K decoder.",
                 }),
+                "match_original_size": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "When True (default), PiD acts as a drop-in VAE alternative — output matches the size a regular VAE Decode would have produced. The latent is internally downscaled by `scale` so PiD can do its trained SR job back to native size, which keeps the network in its training distribution. Turn this off for true super-resolution decode (output = VAE_native × scale).",
+                }),
                 "scale": ("INT", {
                     "default": 4,
                     "min": 1,
                     "max": 8,
                     "step": 1,
-                    "tooltip": "Upscale factor. Output resolution = VAE_native × scale. "
-                               "Default 4 means 512→2048 for flux/zimage.",
+                    "tooltip": "PiD's internal SR factor. With match_original_size=True it controls how aggressively the latent is downscaled before PiD reconstructs (4 matches the sr4x checkpoints; 8 matches the sr8x scale_rae). With match_original_size=False this is the literal output upscale factor (output = VAE_native × scale).",
                 }),
                 "pid_inference_steps": ("INT", {
                     "default": 4,
@@ -424,6 +427,7 @@ class PiDDecode:
         pid_inference_steps: int,
         cfg_scale: float,
         seed: int,
+        match_original_size: bool = True,
         degrade_sigma: float = 0.0,
         vram_mode: str = "gpu",
         shift: float = 0.0,
@@ -510,15 +514,47 @@ class PiDDecode:
             else:
                 vae_compression = 8
 
-        # Compute target image size
-        target_h = zH * vae_compression * scale
-        target_w = zW * vae_compression * scale
-        image_size = (target_h, target_w)
+        # Cache the original latent dimensions before we (maybe) downscale them
+        # so log lines and the LQ_video_or_image / target_h placeholders that
+        # follow can refer to the version PiD will actually consume.
+        orig_zH, orig_zW = zH, zW
 
-        logger.info(
-            f"PiD decode: latent {zH}×{zW} → vae_native {zH * vae_compression}×{zW * vae_compression} "
-            f"→ PiD output {target_h}×{target_w}"
-        )
+        if match_original_size:
+            # VAE-alternative mode: downscale the latent by `scale` so PiD's
+            # trained `scale`× SR pass lands us back at the original VAE-native
+            # output resolution. This keeps the checkpoint operating in the
+            # regime it was distilled at (the sr4x / sr8x naming) while
+            # producing an output the same size a plain VAE.decode(latent)
+            # would have given. Math is floor-division, so non-divisible dims
+            # are silently clipped to the nearest multiple of `scale` — usually
+            # within a few pixels of the exact VAE-native size.
+            zH = max(1, orig_zH // scale)
+            zW = max(1, orig_zW // scale)
+            if (zH, zW) != (orig_zH, orig_zW):
+                import torch.nn.functional as F
+                latent_tensor = F.interpolate(
+                    latent_tensor, size=(zH, zW), mode="area",
+                )
+            target_h = zH * vae_compression * scale
+            target_w = zW * vae_compression * scale
+            image_size = (target_h, target_w)
+            logger.info(
+                f"PiD decode (match_original_size=True): "
+                f"latent {orig_zH}×{orig_zW} → downscaled {zH}×{zW} "
+                f"→ PiD output {target_h}×{target_w} "
+                f"(target ≈ VAE-native {orig_zH * vae_compression}×{orig_zW * vae_compression})"
+            )
+        else:
+            # Super-resolution mode: keep the latent and ask for a scale× larger
+            # output than VAE-native.
+            target_h = zH * vae_compression * scale
+            target_w = zW * vae_compression * scale
+            image_size = (target_h, target_w)
+            logger.info(
+                f"PiD decode (match_original_size=False, SR×{scale}): "
+                f"latent {zH}×{zW} → vae_native {zH * vae_compression}×{zW * vae_compression} "
+                f"→ PiD output {target_h}×{target_w}"
+            )
 
         # ---- Move model to target device (one-shot) ----
         # Past versions tried to keep VRAM down by bouncing the text encoder
