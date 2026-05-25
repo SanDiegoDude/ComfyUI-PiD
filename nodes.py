@@ -364,9 +364,9 @@ class PiDDecode:
                     "tooltip": "Noise level indicator. 0.0 = clean latent (standard KSampler output). "
                                "Higher values indicate the latent has more noise (e.g. from early termination).",
                 }),
-                "vram_mode": (["low", "high", "cpu"], {
-                    "default": "low",
-                    "tooltip": "low: Offload text encoder during sampling to save VRAM. high: Keep all models in VRAM for speed. cpu: Run on CPU.",
+                "vram_mode": (["gpu", "cpu"], {
+                    "default": "gpu",
+                    "tooltip": "gpu: Run on the active CUDA device. cpu: Run on CPU (very slow; only use if you don't have a usable GPU).",
                 }),
                 "shift": ("FLOAT", {
                     "default": 0.0,
@@ -425,7 +425,7 @@ class PiDDecode:
         cfg_scale: float,
         seed: int,
         degrade_sigma: float = 0.0,
-        vram_mode: str = "low",
+        vram_mode: str = "gpu",
         shift: float = 0.0,
         sampler: str = "default",
         scheduler: str = "default",
@@ -433,6 +433,16 @@ class PiDDecode:
         compile_mode: str = "none",
         prompt_cache: bool = True,
     ):
+        # Backwards compat: an earlier version of this node exposed a 3-way
+        # "low / high / cpu" vram_mode. The "low" variant tried to keep VRAM
+        # down by offloading the text encoder during sampling, but that path
+        # actually moved a multi-GB text encoder to CPU only to immediately
+        # move it back to GPU via model.to(device), tripling the transfer
+        # cost for no actual VRAM savings. Map the old values onto "gpu" so
+        # workflows saved with the previous menu still work.
+        if vram_mode in ("low", "high"):
+            vram_mode = "gpu"
+
         # ---- Load model (cached) ----
         model, config = _load_pid_model(backbone, ckpt_type)
 
@@ -510,51 +520,34 @@ class PiDDecode:
             f"→ PiD output {target_h}×{target_w}"
         )
 
+        # ---- Move model to target device (one-shot) ----
+        # Past versions tried to keep VRAM down by bouncing the text encoder
+        # in and out of GPU. That ended up moving the same multi-GB tensor
+        # three times per call without saving anything (model.to(device) at
+        # the end of the encoding phase pulled the text encoder back onto GPU
+        # anyway because it's a submodule). Just put everything on the target
+        # device once; the post-decode cleanup below offloads it back to CPU
+        # to free VRAM for downstream nodes.
+        model.to(device)
+        if hasattr(model, "text_encoder") and model.text_encoder is not None:
+            model.text_encoder.to(device)
+        if hasattr(model, "_null_caption_embs") and isinstance(model._null_caption_embs, torch.Tensor):
+            model._null_caption_embs = model._null_caption_embs.to(device)
+
         # ---- Text Encoding Phase ----
         caption_key = model.config.input_caption_key
         captions = [prompt] * B
 
         # Check Prompt Cache
         prompt_cache_key = (prompt, backbone, ckpt_type)
-        caption_embs = None
         if prompt_cache and prompt_cache_key in _PROMPT_CACHE:
-            logger.info("PiD: Prompt embedding cache hit! Bypassing text encoder loading/execution.")
+            logger.info("PiD: Prompt embedding cache hit! Bypassing text encoder.")
             caption_embs = _PROMPT_CACHE[prompt_cache_key].to(device)
         else:
-            if vram_mode == "low" and device.type == "cuda":
-                logger.info("PiD [Low VRAM]: Loading text encoder to GPU...")
-                model.text_encoder.to(device)
-                if hasattr(model, "_null_caption_embs") and isinstance(model._null_caption_embs, torch.Tensor):
-                    model._null_caption_embs = model._null_caption_embs.to(device)
-                
-                with torch.no_grad():
-                    caption_embs, _ = model._encode_text_raw(captions)
-                
-                logger.info("PiD [Low VRAM]: Offloading text encoder to CPU...")
-                model.text_encoder.to("cpu")
-                if hasattr(model, "_null_caption_embs") and isinstance(model._null_caption_embs, torch.Tensor):
-                    model._null_caption_embs = model._null_caption_embs.to("cpu")
-                comfy.model_management.soft_empty_cache()
-            else:
-                # For high or cpu, move the entire model framework + text encoder to target device
-                model.to(device)
-                if hasattr(model, "text_encoder") and model.text_encoder is not None:
-                    model.text_encoder.to(device)
-                if hasattr(model, "_null_caption_embs") and isinstance(model._null_caption_embs, torch.Tensor):
-                    model._null_caption_embs = model._null_caption_embs.to(device)
-                
-                with torch.no_grad():
-                    caption_embs, _ = model._encode_text_raw(captions)
-            
+            with torch.no_grad():
+                caption_embs, _ = model._encode_text_raw(captions)
             if prompt_cache:
                 _PROMPT_CACHE[prompt_cache_key] = caption_embs.cpu()
-
-        # Load sampler framework to GPU (if in low VRAM mode and running on CUDA)
-        if vram_mode == "low" and device.type == "cuda":
-            logger.info("PiD [Low VRAM]: Loading sampler framework to GPU...")
-            model.to(device)
-        else:
-            model.to(device)
 
         # ---- Diffusion Sampling Phase ----
         data_batch = {
@@ -581,6 +574,10 @@ class PiDDecode:
         if is_native:
             pbar = comfy.utils.ProgressBar(pid_inference_steps)
             def progress_callback(step, total_steps):
+                # Honor ComfyUI's interrupt button — raises
+                # InterruptProcessingException, which propagates up out of
+                # PiD's sampling loop and back to ComfyUI's executor.
+                comfy.model_management.throw_exception_if_processing_interrupted()
                 pbar.update_absolute(step + 1, total_steps, None)
 
             with torch.no_grad():
@@ -662,6 +659,7 @@ class PiDDecode:
             
             pbar = comfy.utils.ProgressBar(pid_inference_steps)
             def comfy_callback(step, denoised, x_state, total_steps):
+                comfy.model_management.throw_exception_if_processing_interrupted()
                 pbar.update_absolute(step + 1, total_steps, None)
 
             with torch.no_grad():
