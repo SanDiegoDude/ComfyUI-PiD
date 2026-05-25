@@ -74,7 +74,16 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.storage import StorageReader
 from torch.distributed.checkpoint.utils import _api_bc_check, _DistWrapper, _profile
-from torch.distributed.tensor import distribute_tensor
+
+try:
+    # torch >= 2.5 promoted distribute_tensor to the public namespace.
+    from torch.distributed.tensor import distribute_tensor
+except ImportError:
+    # torch 2.4.x (and earlier) only exposes it via the private _tensor module.
+    # The function is only invoked from the DCP save path; we still import it
+    # at module load so the rest of dcp.py stays importable when older torch
+    # versions are paired with this checkpointer.
+    from torch.distributed._tensor import distribute_tensor
 
 from pid._ext.imaginaire.checkpointer.base import AbstractCheckpointer
 from pid._ext.imaginaire.checkpointer.s3_filesystem import S3StorageReader, S3StorageWriter
