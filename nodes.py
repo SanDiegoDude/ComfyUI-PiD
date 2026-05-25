@@ -245,53 +245,6 @@ def _load_pid_model(backbone: str, ckpt_type: str):
     return model, config
 
 
-# ---------------------------------------------------------------------------
-# Helper classes for ComfyUI sampler/scheduler integration
-# ---------------------------------------------------------------------------
-class MockModelSampling:
-    def __init__(self):
-        self.sigma_min = 0.0
-        self.sigma_max = 1.0
-        self.sigmas = torch.linspace(1.0, 0.0, 1000)
-
-    def timestep(self, sigma):
-        return sigma * 999.0
-
-    def sigma(self, timestep):
-        return timestep / 999.0
-
-    def noise_scaling(self, sigma, noise, latent_image, max_denoise=False):
-        return noise
-
-    def inverse_noise_scaling(self, sigma, samples):
-        return samples
-
-
-class MockInnerInnerModel:
-    def scale_latent_inpaint(self, *args, **kwargs):
-        return 0.0
-
-
-class MockInnerModel:
-    def __init__(self):
-        self.model_sampling = MockModelSampling()
-        self.inner_model = MockInnerInnerModel()
-
-
-class MockModelWrap:
-    def __init__(self, denoise_fn):
-        self.inner_model = MockInnerModel()
-        self.denoise_fn = denoise_fn
-
-    def __call__(self, x, sigma, model_options={}, seed=None):
-        return self.denoise_fn(x, sigma)
-
-    def get_model_object(self, name):
-        if name == "model_sampling":
-            return self.inner_model.model_sampling
-        return None
-
-
 class PiDDecode:
     """
     Decode latent samples using PiD (Pixel Diffusion Decoder).
@@ -313,15 +266,25 @@ class PiDDecode:
       - 2kto4k: Multi-resolution decoder (1024→4K at 4× scale)
     """
 
+    # Sampler / scheduler choices are deliberately limited to what PiD's
+    # student sampler implements natively (see _get_t_list and
+    # _student_sample_loop in pid/_src/models/pid_distill_model.py). An
+    # earlier version of this node exposed the full Comfy SAMPLER_NAMES /
+    # SCHEDULER_NAMES dropdowns and tried to wrap PiD as a Comfy
+    # noise-prediction model via a MockModelSampling shim — but PiD is a
+    # flow-matching model with t in [0,1], so anything outside the native
+    # set produced wrong sigma ranges and out-of-distribution forwards
+    # (when it didn't NameError outright). Limiting the dropdowns here
+    # makes every selectable combination route through PiD's own
+    # distilled sampler code, which is the only path that's actually
+    # been validated against the released checkpoints.
+    _NATIVE_SAMPLERS = ["default", "ode_euler", "ode_heun", "sde_ancestral"]
+    _NATIVE_SCHEDULERS = ["default", "linear", "karras", "exponential", "cosine"]
+
     @classmethod
     def INPUT_TYPES(cls):
-        try:
-            import comfy.samplers
-            samplers = ["default"] + sorted(list(comfy.samplers.KSampler.SAMPLERS))
-            schedulers = ["default"] + sorted(list(comfy.samplers.KSampler.SCHEDULERS))
-        except Exception:
-            samplers = ["default", "ode_euler", "ode_heun", "sde_ancestral"]
-            schedulers = ["default", "linear", "karras", "exponential", "cosine"]
+        samplers = list(cls._NATIVE_SAMPLERS)
+        schedulers = list(cls._NATIVE_SCHEDULERS)
 
         return {
             "required": {
@@ -407,11 +370,24 @@ class PiDDecode:
                 }),
                 "sampler": (samplers, {
                     "default": "default",
-                    "tooltip": "Sampler algorithm to use for the diffusion decoding loop. 'default' uses the model config's standard sampler.",
+                    "tooltip": (
+                        "Sampling algorithm. 'default' uses the model's distilled student_sample_type "
+                        "(SDE-ancestral for the released checkpoints). 'ode_euler' / 'ode_heun' run "
+                        "deterministic ODE steps; 'sde_ancestral' adds noise injection between steps. "
+                        "Only PiD-native samplers are exposed because PiD is a flow-matching model "
+                        "(t in [0,1]) and Comfy's noise-prediction samplers aren't compatible with its "
+                        "training-time sigma convention."
+                    ),
                 }),
                 "scheduler": (schedulers, {
                     "default": "default",
-                    "tooltip": "Noise schedule type. 'default' uses the model's pre-configured steps. Others generate dynamic step distributions.",
+                    "tooltip": (
+                        "Timestep schedule. 'default' uses the model's distilled student_t_list "
+                        "(e.g. [0.999, 0.866, 0.634, 0.342, 0.0] for the 4-step checkpoints) and is "
+                        "the only choice validated against the released weights. Others rebuild a "
+                        "dynamic schedule (linear / karras / exponential / cosine) and may help when "
+                        "you change pid_inference_steps from the distilled count."
+                    ),
                 }),
                 "precision": (["model_default", "fp16", "bf16", "fp32"], {
                     "default": "model_default",
@@ -678,113 +654,34 @@ class PiDDecode:
             ),
         }
 
-        # Resolve shift (0.0 means config / model defaults)
+        # Resolve shift (0.0 means config / model defaults).
         shift_val = float(shift) if float(shift) > 0.0 else None
 
-        native_samplers = ["default", "ode_euler", "ode_heun", "sde_ancestral"]
-        native_schedulers = ["default", "linear", "karras", "exponential", "cosine"]
+        # PiD has its own student sampler in pid_distill_model.generate_samples_from_batch
+        # that natively supports the sampler / scheduler combinations exposed in
+        # _NATIVE_SAMPLERS / _NATIVE_SCHEDULERS above. INPUT_TYPES restricts the
+        # dropdown to that set, so anything that lands here is guaranteed to be
+        # routed through the model's own distilled code (no Comfy KSampler shim).
+        pbar = comfy.utils.ProgressBar(pid_inference_steps)
+        def progress_callback(step, total_steps):
+            # Honor ComfyUI's interrupt button — raises
+            # InterruptProcessingException, which propagates up out of
+            # PiD's sampling loop and back to ComfyUI's executor.
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            pbar.update_absolute(step + 1, total_steps, None)
 
-        is_native = (sampler in native_samplers) and (scheduler in native_schedulers)
-
-        if is_native:
-            pbar = comfy.utils.ProgressBar(pid_inference_steps)
-            def progress_callback(step, total_steps):
-                # Honor ComfyUI's interrupt button — raises
-                # InterruptProcessingException, which propagates up out of
-                # PiD's sampling loop and back to ComfyUI's executor.
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                pbar.update_absolute(step + 1, total_steps, None)
-
-            with torch.no_grad():
-                samples = model.generate_samples_from_batch(
-                    data_batch,
-                    cfg_scale=cfg_scale,
-                    num_steps=pid_inference_steps,
-                    seed=seed,
-                    shift=shift_val,
-                    image_size=image_size,
-                    callback=progress_callback,
-                    sampler=sampler,
-                    scheduler=scheduler,
-                )
-        else:
-            import comfy.samplers
-            from contextlib import nullcontext
-
-            # Resolve default strings
-            active_sampler = "euler" if sampler == "default" else sampler
-            active_scheduler = "normal" if scheduler == "default" else scheduler
-
-            # 1. Compute sigmas using ComfyUI's scheduler registry
-            mock_sampling = MockModelSampling()
-            sigmas = comfy.samplers.calculate_sigmas(mock_sampling, active_scheduler, pid_inference_steps)
-            sigmas = sigmas.to(device)
-
-            # 2. Apply shift if requested
-            if shift_val is not None and shift_val > 0.0:
-                sigmas = shift_val * sigmas / (1.0 + (shift_val - 1.0) * sigmas)
-                sigmas = torch.clamp(sigmas, min=0.0, max=1.0)
-                sigmas[-1] = 0.0
-
-            # 3. Setup denoise function
-            timescale = model.fm_trainer.timescale
-            net = model.net
-            autocast_ctx = torch.autocast(device.type, dtype=model.autocast_dtype) if (model.autocast_dtype and device.type != "cpu") else nullcontext()
-            degrade_sigma_tensor = data_batch["degrade_sigma"]
-            lq_video_or_image = data_batch["LQ_video_or_image"]
-            lq_latent = data_batch["LQ_latent"]
-
-            def denoise_fn(x_state, sigma_val):
-                t_cur = sigma_val
-                if not isinstance(t_cur, torch.Tensor):
-                    t_cur = torch.tensor([float(t_cur)], device=x_state.device, dtype=x_state.dtype)
-                elif t_cur.ndim == 0:
-                    t_cur = t_cur.unsqueeze(0)
-                
-                B_current = x_state.shape[0]
-                if t_cur.shape[0] != B_current:
-                    t_cur = t_cur.expand(B_current)
-
-                t_cur_scaled = t_cur * timescale
-
-                # Run network forward pass
-                with autocast_ctx:
-                    v_pred = net(
-                        x_state.to(dtype=model.autocast_dtype if model.autocast_dtype else torch.float32),
-                        t_cur_scaled,
-                        caption_embs,
-                        lq_video_or_image=lq_video_or_image,
-                        lq_latent=lq_latent,
-                        degrade_sigma=degrade_sigma_tensor,
-                    )
-                
-                # Convert velocity to x0 pred
-                x0_pred = model._velocity_to_x0(x_state, v_pred, t_cur)
-                return x0_pred.to(x_state.dtype)
-
-            # 4. Prepare noise and generator
-            gen = torch.Generator(device=device).manual_seed(seed)
-            noise = torch.randn(B, 3, target_h, target_w, device=device, generator=gen)
-
-            # 5. Instantiate Mock Model Wrap
-            model_wrap = MockModelWrap(denoise_fn)
-
-            # 6. Instantiate Sampler and Sample
-            sampler_obj = comfy.samplers.sampler_object(active_sampler)
-            
-            pbar = comfy.utils.ProgressBar(pid_inference_steps)
-            def comfy_callback(step, denoised, x_state, total_steps):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                pbar.update_absolute(step + 1, total_steps, None)
-
-            with torch.no_grad():
-                samples = sampler_obj.sample(
-                    model_wrap,
-                    sigmas,
-                    extra_args={},
-                    callback=comfy_callback,
-                    noise=noise,
-                )
+        with torch.no_grad():
+            samples = model.generate_samples_from_batch(
+                data_batch,
+                cfg_scale=cfg_scale,
+                num_steps=pid_inference_steps,
+                seed=seed,
+                shift=shift_val,
+                image_size=image_size,
+                callback=progress_callback,
+                sampler=sampler,
+                scheduler=scheduler,
+            )
 
         # ---- Convert PiD output to ComfyUI IMAGE format ----
         # PiD output: [B, 3, 1, H, W] in [-1, 1] (5D with T=1)
