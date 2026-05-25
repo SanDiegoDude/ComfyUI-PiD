@@ -323,8 +323,15 @@ class PiDDecode:
                 "latent": ("LATENT",),
                 "prompt": ("STRING", {
                     "multiline": True,
-                    "default": "high quality, detailed",
-                    "tooltip": "Text prompt describing the image content. Used by PiD's text encoder for conditioning.",
+                    "default": "",
+                    "tooltip": (
+                        "Text prompt describing the IMAGE CONTENT (not style modifiers). "
+                        "PiD wraps this in a chi-prompt template that asks gemma-2-2b to expand it into a "
+                        "detailed visual description, so generic placeholders like 'high quality, detailed' "
+                        "give gemma nothing to anchor on and produce mushy / over-smoothed output. "
+                        "For best quality, pass the same prompt you used to generate the latent. "
+                        "Empty string is allowed but quality will suffer."
+                    ),
                 }),
                 "backbone": (["flux", "flux2", "sd3", "zimage", "rae", "scale_rae"], {
                     "default": "flux",
@@ -336,14 +343,29 @@ class PiDDecode:
                 }),
                 "match_original_size": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "When True (default), PiD acts as a drop-in VAE alternative — output matches the size a regular VAE Decode would have produced. The latent is internally downscaled by `scale` so PiD can do its trained SR job back to native size, which keeps the network in its training distribution. Turn this off for true super-resolution decode (output = VAE_native × scale).",
+                    "tooltip": (
+                        "When True (default), PiD acts as a drop-in VAE alternative — output "
+                        "matches the size a regular VAE Decode would have produced. The latent "
+                        "is downsampled toward the model's training grid (clamped: never below "
+                        "natural grid, never above your input), PiD runs at its training output "
+                        "resolution, and the final image is bilinear-resized to VAE-native size. "
+                        "Keeps PiD inside its training distribution regardless of input resolution. "
+                        "When False, PiD upscales — output = VAE_native × scale (true SR mode)."
+                    ),
                 }),
                 "scale": ("INT", {
                     "default": 4,
                     "min": 1,
                     "max": 8,
                     "step": 1,
-                    "tooltip": "PiD's internal SR factor. With match_original_size=True it controls how aggressively the latent is downscaled before PiD reconstructs (4 matches the sr4x checkpoints; 8 matches the sr8x scale_rae). With match_original_size=False this is the literal output upscale factor (output = VAE_native × scale).",
+                    "tooltip": (
+                        "PiD's SR factor. The released checkpoints are sr4x (Flux/SD3/Flux2/RAE) "
+                        "or sr8x (scale_rae) — change this only if you know what you're doing. "
+                        "match_original_size=True: how aggressively to downsample the latent "
+                        "before reconstruction (capped at the model's training grid). "
+                        "match_original_size=False: the literal output upscale factor "
+                        "(output = VAE_native × scale)."
+                    ),
                 }),
                 "pid_inference_steps": ("INT", {
                     "default": 4,
@@ -519,41 +541,85 @@ class PiDDecode:
         # follow can refer to the version PiD will actually consume.
         orig_zH, orig_zW = zH, zW
 
+        # ---- Compute the model's "natural" training latent grid ----
+        # Each released checkpoint was distilled at a specific (output_res,
+        # vae_compression, sr_scale_trained) triple. PiD's network has those
+        # ratios baked into the LQ-projection layer (z_to_patch_ratio) so the
+        # model's training distribution sits at exactly:
+        #     latent_grid = output_res / (vae_compression * sr_scale_trained)
+        # Going noticeably below that grid (e.g. by floor-dividing a small
+        # latent through a large `scale`) feeds the LQ projection a token
+        # count it never saw in training, and the output goes mushy/soft —
+        # which is the most common cause of "PiD output looks bad" reports.
+        sr_scale_trained = 8 if backbone == "scale_rae" else 4
+        training_output_res = 4096 if ckpt_type == "2kto4k" else 2048
+        natural_grid_h = max(1, training_output_res // (vae_compression * sr_scale_trained))
+        natural_grid_w = natural_grid_h  # released checkpoints all train square
+
+        # Final user-facing output size. For match_original_size=True this is
+        # the VAE-native size of the original latent; for SR mode it's
+        # latent_grid * vae_compression * scale.
         if match_original_size:
-            # VAE-alternative mode: downscale the latent by `scale` so PiD's
-            # trained `scale`× SR pass lands us back at the original VAE-native
-            # output resolution. This keeps the checkpoint operating in the
-            # regime it was distilled at (the sr4x / sr8x naming) while
-            # producing an output the same size a plain VAE.decode(latent)
-            # would have given. Math is floor-division, so non-divisible dims
-            # are silently clipped to the nearest multiple of `scale` — usually
-            # within a few pixels of the exact VAE-native size.
-            zH = max(1, orig_zH // scale)
-            zW = max(1, orig_zW // scale)
-            if (zH, zW) != (orig_zH, orig_zW):
+            # ---- VAE-alternative mode (default) ----
+            # Goal: emit an image at exactly the size a plain VAE.decode would
+            # have produced. We do this in three steps:
+            #   1. Pick a PiD input grid that's <= the user's latent (no
+            #      magic upsampling) and >= the model's natural training grid
+            #      (so the LQ projection sees a token count it has actually
+            #      seen during training). The user's `scale` knob is the
+            #      target divisor; `natural_grid_h` is the floor.
+            #   2. Run PiD at its training-time output resolution (pid_grid *
+            #      vae_compression * sr_scale_trained). This keeps every
+            #      RoPE / lq-projection / fm-shift assumption inside the
+            #      model's distilled regime.
+            #   3. Bilinear-resize PiD's output to the user-requested
+            #      VAE-native size. This last step is a small, lossy-only-
+            #      because-it's-a-resize step — much cheaper than feeding
+            #      the network out-of-distribution token counts.
+            user_target_h = orig_zH * vae_compression
+            user_target_w = orig_zW * vae_compression
+
+            pid_zH = min(orig_zH, max(orig_zH // max(1, scale), natural_grid_h))
+            pid_zW = min(orig_zW, max(orig_zW // max(1, scale), natural_grid_w))
+
+            if (pid_zH, pid_zW) != (orig_zH, orig_zW):
                 import torch.nn.functional as F
                 latent_tensor = F.interpolate(
-                    latent_tensor, size=(zH, zW), mode="area",
+                    latent_tensor, size=(pid_zH, pid_zW), mode="area",
                 )
-            target_h = zH * vae_compression * scale
-            target_w = zW * vae_compression * scale
-            image_size = (target_h, target_w)
+            zH, zW = pid_zH, pid_zW
+
+            pid_target_h = zH * vae_compression * sr_scale_trained
+            pid_target_w = zW * vae_compression * sr_scale_trained
+            image_size = (pid_target_h, pid_target_w)
+
+            final_target_h = user_target_h
+            final_target_w = user_target_w
+            need_post_resize = (pid_target_h, pid_target_w) != (final_target_h, final_target_w)
+
             logger.info(
                 f"PiD decode (match_original_size=True): "
-                f"latent {orig_zH}×{orig_zW} → downscaled {zH}×{zW} "
-                f"→ PiD output {target_h}×{target_w} "
-                f"(target ≈ VAE-native {orig_zH * vae_compression}×{orig_zW * vae_compression})"
+                f"latent {orig_zH}×{orig_zW} → PiD-input {zH}×{zW} "
+                f"(natural training grid={natural_grid_h}, sr_scale_trained={sr_scale_trained}) "
+                f"→ PiD output {pid_target_h}×{pid_target_w} "
+                f"→ final {final_target_h}×{final_target_w} (VAE-native of original latent)"
             )
         else:
-            # Super-resolution mode: keep the latent and ask for a scale× larger
-            # output than VAE-native.
-            target_h = zH * vae_compression * scale
-            target_w = zW * vae_compression * scale
-            image_size = (target_h, target_w)
+            # ---- Super-resolution mode ----
+            # Keep the latent at its full grid and ask PiD for a `scale`-times
+            # larger output. NTK-aware RoPE handles output sizes above the
+            # training resolution gracefully; below sr_scale_trained the LQ
+            # projection still architecturally fits but expect quality drop.
+            pid_target_h = zH * vae_compression * scale
+            pid_target_w = zW * vae_compression * scale
+            image_size = (pid_target_h, pid_target_w)
+            final_target_h = pid_target_h
+            final_target_w = pid_target_w
+            need_post_resize = False
             logger.info(
                 f"PiD decode (match_original_size=False, SR×{scale}): "
                 f"latent {zH}×{zW} → vae_native {zH * vae_compression}×{zW * vae_compression} "
-                f"→ PiD output {target_h}×{target_w}"
+                f"→ PiD output {pid_target_h}×{pid_target_w}"
             )
 
         # ---- Move model to target device (one-shot) ----
@@ -590,6 +656,14 @@ class PiDDecode:
             caption_key: captions,
             "caption_embs": caption_embs,
             "LQ_latent": latent_tensor.to(dtype=model.autocast_dtype if model.autocast_dtype else torch.float32, device=device),
+            # The released distill checkpoints have lq_condition_type="latent"
+            # (see pid/_src/configs/pid/experiment/shared_config.py), so the
+            # network's image branch is unused. Pass a small zero placeholder
+            # to satisfy the data-batch contract — _demo_from_clean_common.py
+            # in the upstream repo uses the same zeros placeholder for the
+            # exact same reason. We size it at the latent's vae-native size
+            # (cheap allocation) instead of the SR target so we don't waste
+            # memory on a tensor the model immediately discards.
             "LQ_video_or_image": torch.zeros(
                 B, 3, zH * vae_compression, zW * vae_compression,
                 dtype=model.autocast_dtype if model.autocast_dtype else torch.float32, device=device,
@@ -715,6 +789,19 @@ class PiDDecode:
         # Squeeze the temporal dimension if present
         if output.ndim == 5:
             output = output.squeeze(2)  # [B, 3, H, W]
+
+        # Post-resize when match_original_size required PiD to run at its
+        # training output resolution but the user asked for a different
+        # VAE-native size. This is the second half of the "stay in
+        # distribution then resize" strategy from the size-computation block
+        # above; keeping the bilinear here (instead of inside the noise /
+        # sampler loop) means PiD only sees in-distribution shapes.
+        if need_post_resize and (output.shape[-2] != final_target_h or output.shape[-1] != final_target_w):
+            import torch.nn.functional as F
+            output = F.interpolate(
+                output, size=(final_target_h, final_target_w),
+                mode="bilinear", align_corners=False,
+            )
 
         # Convert [-1, 1] → [0, 1] and rearrange to [B, H, W, C]
         output = (output + 1.0) / 2.0
